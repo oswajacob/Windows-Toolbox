@@ -20,12 +20,6 @@ namespace Kfzt.Core
     /// <summary>
     /// Motor central que ejecuta comandos del sistema (sfc, dism, chkdsk, etc.)
     /// sin mostrar consola, capturando su salida en tiempo real.
-    ///
-    /// Reglas de negocio que implementa:
-    ///  - Solo se puede correr UNA tarea a la vez en toda la app (candado estático)
-    ///  - NUNCA se mata el proceso por tardanza — el timeout solo avisa (evento OnStalled)
-    ///  - Reporta cada línea de salida vía evento, para que la ventana de progreso
-    ///    la muestre en tiempo real sin necesidad de una consola visible
     /// </summary>
     public class TaskRunner
     {
@@ -42,25 +36,15 @@ namespace Kfzt.Core
         private static readonly TimeSpan TiempoDeAvisoPorInactividad = TimeSpan.FromMinutes(10);
 
         // ---- Eventos que la ventana de progreso puede escuchar ----
-
-        /// <summary>Se dispara cada vez que el comando imprime una línea nueva.</summary>
         public event Action<string> OnOutputLine;
-
-        /// <summary>
-        /// Se dispara si pasa mucho tiempo sin output nuevo. Es SOLO informativo:
-        /// el proceso sigue corriendo, esto no lo cancela ni lo toca.
-        /// </summary>
         public event Action OnStalled;
-
-        /// <summary>Se dispara cuando el proceso termina, con el resultado final.</summary>
         public event Action<TaskResult> OnFinished;
 
         /// <summary>
-        /// Intenta iniciar un comando. Devuelve false de inmediato (sin hacer nada)
-        /// si ya hay otra tarea corriendo — así se cumple la regla de "una a la vez",
-        /// bloqueando/negando en vez de permitir que se encimen dos tareas.
+        /// Intenta iniciar un comando. Permite enviar una respuesta automática (ej. "S")
+        /// para comandos interactivos como chkdsk.
         /// </summary>
-        public bool TryStart(string archivo, string argumentos)
+        public bool TryStart(string archivo, string argumentos, string respuestaAutomatica = null)
         {
             lock (_lock)
             {
@@ -70,11 +54,11 @@ namespace Kfzt.Core
                 _hayTareaActiva = true;
             }
 
-            _ = EjecutarAsync(archivo, argumentos); // fire-and-forget: corre en segundo plano
+            _ = EjecutarAsync(archivo, argumentos, respuestaAutomatica); // fire-and-forget: corre en segundo plano
             return true;
         }
 
-        private async Task EjecutarAsync(string archivo, string argumentos)
+        private async Task EjecutarAsync(string archivo, string argumentos, string respuestaAutomatica)
         {
             var salidaCompleta = new StringBuilder();
             string errorDetectado = null;
@@ -122,8 +106,14 @@ namespace Kfzt.Core
                 proceso.BeginOutputReadLine();
                 proceso.BeginErrorReadLine();
 
-                // Vigilante de inactividad: revisa cada 30s si ya pasó el umbral
-                // de "esto está tardando" — SOLO avisa, jamás mata el proceso.
+                // Si nos dieron una respuesta automática (ej. "S" para confirmaciones), la enviamos
+                if (!string.IsNullOrEmpty(respuestaAutomatica))
+                {
+                    proceso.StandardInput.WriteLine(respuestaAutomatica);
+                    proceso.StandardInput.Flush();
+                }
+
+                // Vigilante de inactividad
                 using (var vigilante = new CancellationTokenSource())
                 {
                     var tareaVigilante = Task.Run(async () =>
@@ -136,7 +126,7 @@ namespace Kfzt.Core
                             }
                             catch (TaskCanceledException)
                             {
-                                break; // el proceso ya terminó, dejamos de vigilar
+                                break;
                             }
 
                             if (!avisoYaDisparado &&
@@ -160,7 +150,7 @@ namespace Kfzt.Core
                     ErrorDetectado = errorDetectado
                 };
 
-                lock (_lock) { _hayTareaActiva = false; } // libera el candado para la siguiente tarea
+                lock (_lock) { _hayTareaActiva = false; }
 
                 OnFinished?.Invoke(resultado);
             }
